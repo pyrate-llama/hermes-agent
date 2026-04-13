@@ -77,7 +77,7 @@ def _get_loop() -> asyncio.AbstractEventLoop:
         return _loop
 
 
-def _run_sync(coro, timeout: float = 120.0):
+def _run_sync(coro, timeout: float = 30.0):
     """Schedule *coro* on the shared loop and block until done."""
     loop = _get_loop()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
@@ -579,10 +579,20 @@ class HindsightMemoryProvider(MemoryProvider):
                     # If the config changed and the daemon is running, stop it.
                     from pathlib import Path as _Path
                     profile_env = _Path.home() / ".hindsight" / "profiles" / f"{profile}.env"
-                    current_key = self._config.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", "")
+                    current_key = (
+                        self._config.get("llmApiKey")
+                        or self._config.get("llm_api_key")
+                        or os.environ.get("HINDSIGHT_API_LLM_API_KEY", "")
+                        or os.environ.get("HINDSIGHT_LLM_API_KEY", "")
+                    )
                     current_provider = self._config.get("llm_provider", "")
                     current_model = self._config.get("llm_model", "")
                     current_base_url = self._config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
+
+                    # Export key to os.environ so subprocess.Popen inherits it
+                    if current_key:
+                        os.environ["HINDSIGHT_API_LLM_API_KEY"] = current_key
+                        os.environ["HINDSIGHT_LLM_API_KEY"] = current_key
                     # Map openai_compatible/openrouter → openai for the daemon (OpenAI wire format)
                     daemon_provider = "openai" if current_provider in ("openai_compatible", "openrouter") else current_provider
 
@@ -681,6 +691,7 @@ class HindsightMemoryProvider(MemoryProvider):
             query = query[:self._recall_max_input_chars]
 
         def _run():
+            self._ensure_daemon_alive()
             try:
                 client = self._get_client()
                 if self._prefetch_method == "reflect":
@@ -707,6 +718,28 @@ class HindsightMemoryProvider(MemoryProvider):
                     with self._prefetch_lock:
                         self._prefetch_result = text
             except Exception as e:
+                if self._is_connection_error(e):
+                    logger.info("Hindsight prefetch: daemon down, attempting restart...")
+                    try:
+                        self._reconnect_client()
+                        # Retry once after restart
+                        client = self._get_client()
+                        if self._prefetch_method == "reflect":
+                            resp = _run_sync(client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                            text = resp.text or ""
+                        else:
+                            recall_kwargs2: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
+                            if self._recall_tags:
+                                recall_kwargs2["tags"] = self._recall_tags
+                                recall_kwargs2["tags_match"] = self._recall_tags_match
+                            resp = _run_sync(client.arecall(**recall_kwargs2))
+                            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                        if text:
+                            with self._prefetch_lock:
+                                self._prefetch_result = text
+                        return
+                    except Exception:
+                        pass
                 logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
@@ -746,6 +779,7 @@ class HindsightMemoryProvider(MemoryProvider):
         content = "[" + ",".join(self._session_turns) + "]"
 
         def _sync():
+            self._ensure_daemon_alive()
             try:
                 client = self._get_client()
                 item: dict = {
@@ -764,6 +798,20 @@ class HindsightMemoryProvider(MemoryProvider):
                 ))
                 logger.debug("Hindsight retain succeeded")
             except Exception as e:
+                if self._is_connection_error(e):
+                    logger.info("Hindsight sync: daemon down, attempting restart...")
+                    try:
+                        self._reconnect_client()
+                        client = self._get_client()
+                        _run_sync(client.aretain_batch(
+                            bank_id=self._bank_id,
+                            items=[item],
+                            document_id=self._session_id,
+                            retain_async=self._retain_async,
+                        ))
+                        return
+                    except Exception:
+                        pass
                 logger.warning("Hindsight sync failed: %s", e, exc_info=True)
 
         if self._sync_thread and self._sync_thread.is_alive():
@@ -776,75 +824,178 @@ class HindsightMemoryProvider(MemoryProvider):
             return []
         return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
 
+    # ------------------------------------------------------------------
+    # Daemon health check & auto-restart (local_embedded mode only)
+    # ------------------------------------------------------------------
+
+    _reconnect_lock = threading.Lock()
+
+    def _daemon_alive(self) -> bool:
+        """Quick synchronous health check — is the daemon responding?"""
+        if self._mode != "local_embedded":
+            return True
+        try:
+            import urllib.request
+            port = 9177  # default hindsight-embed port
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/health", method="GET")
+            urllib.request.urlopen(req, timeout=2)
+            return True
+        except Exception:
+            return False
+
+    def _ensure_daemon_alive(self) -> None:
+        """If the local daemon is down, restart it before making any call."""
+        if self._mode != "local_embedded":
+            return
+        if self._client is None:
+            return  # Not initialized yet, _get_client will handle it
+        if self._daemon_alive():
+            return
+        logger.info("Hindsight health check failed — daemon is down, restarting...")
+        try:
+            self._reconnect_client()
+        except Exception as e:
+            logger.warning("Hindsight proactive restart failed: %s", e)
+
+    def _reconnect_client(self):
+        """Reset the embedded client so _ensure_started() re-launches the daemon."""
+        with self._reconnect_lock:
+            if self._client is None or not hasattr(self._client, '_started'):
+                return
+            # If another thread already fixed it, skip
+            if self._daemon_alive():
+                return
+
+            from pathlib import Path as _Path
+            log_dir = get_hermes_home() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "hindsight-embed.log"
+
+            # Redirect Rich console so background restart doesn't fail on stderr
+            import hindsight_embed.daemon_embed_manager as dem
+            from rich.console import Console
+            dem.console = Console(file=open(log_path, "a"), force_terminal=False)
+
+            # Re-trigger daemon startup
+            self._client._started = False
+            self._client._client = None
+            try:
+                self._client._ensure_started()
+                logger.info("Hindsight daemon restarted successfully")
+            except Exception as e:
+                logger.warning("Hindsight daemon restart failed: %s", e)
+                raise
+
+    def _is_connection_error(self, exc: Exception) -> bool:
+        """Check if an exception indicates the daemon is down."""
+        msg = str(exc).lower()
+        return any(s in msg for s in (
+            "server disconnected", "cannot connect", "connection refused",
+            "connect call failed", "closed", "unreachable",
+            "timeout", "timed out",
+        ))
+
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        self._ensure_daemon_alive()
         try:
             client = self._get_client()
         except Exception as e:
-            logger.warning("Hindsight client init failed: %s", e)
-            return tool_error(f"Hindsight client unavailable: {e}")
+            if self._is_connection_error(e):
+                try:
+                    self._reconnect_client()
+                    client = self._get_client()
+                except Exception as e2:
+                    return tool_error(f"Hindsight unavailable after restart: {e2}")
+            else:
+                logger.warning("Hindsight client init failed: %s", e)
+                return tool_error(f"Hindsight client unavailable: {e}")
 
         if tool_name == "hindsight_retain":
             content = args.get("content", "")
             if not content:
                 return tool_error("Missing required parameter: content")
             context = args.get("context")
-            try:
-                retain_kwargs: dict = {
-                    "bank_id": self._bank_id, "content": content, "context": context,
-                }
-                if self._tags:
-                    retain_kwargs["tags"] = self._tags
-                logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
-                             self._bank_id, len(content), context)
-                _run_sync(client.aretain(**retain_kwargs))
-                logger.debug("Tool hindsight_retain: success")
-                return json.dumps({"result": "Memory stored successfully."})
-            except Exception as e:
-                logger.warning("hindsight_retain failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to store memory: {e}")
+            for _attempt in range(2):
+                try:
+                    retain_kwargs: dict = {
+                        "bank_id": self._bank_id, "content": content, "context": context,
+                    }
+                    if self._tags:
+                        retain_kwargs["tags"] = self._tags
+                    logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
+                                 self._bank_id, len(content), context)
+                    _run_sync(client.aretain(**retain_kwargs))
+                    logger.debug("Tool hindsight_retain: success")
+                    return json.dumps({"result": "Memory stored successfully."})
+                except Exception as e:
+                    if _attempt == 0 and self._is_connection_error(e):
+                        try:
+                            self._reconnect_client()
+                            client = self._get_client()
+                            continue
+                        except Exception:
+                            pass
+                    logger.warning("hindsight_retain failed: %s", e, exc_info=True)
+                    return tool_error(f"Failed to store memory: {e}")
 
         elif tool_name == "hindsight_recall":
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
-            try:
-                recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
-                }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
-                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = _run_sync(client.arecall(**recall_kwargs))
-                num_results = len(resp.results) if resp.results else 0
-                logger.debug("Tool hindsight_recall: %d results", num_results)
-                if not resp.results:
-                    return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
-                return json.dumps({"result": "\n".join(lines)})
-            except Exception as e:
-                logger.warning("hindsight_recall failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to search memory: {e}")
+            for _attempt in range(2):
+                try:
+                    recall_kwargs: dict = {
+                        "bank_id": self._bank_id, "query": query, "budget": self._budget,
+                        "max_tokens": self._recall_max_tokens,
+                    }
+                    if self._recall_tags:
+                        recall_kwargs["tags"] = self._recall_tags
+                        recall_kwargs["tags_match"] = self._recall_tags_match
+                    if self._recall_types:
+                        recall_kwargs["types"] = self._recall_types
+                    logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
+                                 self._bank_id, len(query), self._budget)
+                    resp = _run_sync(client.arecall(**recall_kwargs))
+                    num_results = len(resp.results) if resp.results else 0
+                    logger.debug("Tool hindsight_recall: %d results", num_results)
+                    if not resp.results:
+                        return json.dumps({"result": "No relevant memories found."})
+                    lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                    return json.dumps({"result": "\n".join(lines)})
+                except Exception as e:
+                    if _attempt == 0 and self._is_connection_error(e):
+                        try:
+                            self._reconnect_client()
+                            client = self._get_client()
+                            continue
+                        except Exception:
+                            pass
+                    logger.warning("hindsight_recall failed: %s", e, exc_info=True)
+                    return tool_error(f"Failed to search memory: {e}")
 
         elif tool_name == "hindsight_reflect":
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
-            try:
-                logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = _run_sync(client.areflect(
-                    bank_id=self._bank_id, query=query, budget=self._budget
-                ))
-                logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
-                return json.dumps({"result": resp.text or "No relevant memories found."})
-            except Exception as e:
-                logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to reflect: {e}")
+            for _attempt in range(2):
+                try:
+                    logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
+                                 self._bank_id, len(query), self._budget)
+                    resp = _run_sync(client.areflect(
+                        bank_id=self._bank_id, query=query, budget=self._budget
+                    ))
+                    logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
+                    return json.dumps({"result": resp.text or "No relevant memories found."})
+                except Exception as e:
+                    if _attempt == 0 and self._is_connection_error(e):
+                        try:
+                            self._reconnect_client()
+                            client = self._get_client()
+                            continue
+                        except Exception:
+                            pass
+                    logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
+                    return tool_error(f"Failed to reflect: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 
