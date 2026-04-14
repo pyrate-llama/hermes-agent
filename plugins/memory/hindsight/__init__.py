@@ -857,6 +857,27 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Hindsight proactive restart failed: %s", e)
 
+    @staticmethod
+    def _clear_stale_tasks():
+        """Clear stale async_operations in PostgreSQL that crash the daemon."""
+        try:
+            import subprocess, shutil
+            psql = os.path.expanduser("~/.pg0/installation/18.1.0/bin/psql")
+            if not os.path.exists(psql):
+                psql = shutil.which("psql") or "psql"
+            result = subprocess.run(
+                [psql, "-h", "localhost", "-U", "hindsight", "-d", "hindsight",
+                 "-c", "UPDATE async_operations SET status = 'completed', completed_at = now() WHERE status IN ('pending', 'processing');"],
+                env={**os.environ, "PGPASSWORD": "hindsight"},
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                logger.info("Hindsight: cleared stale tasks: %s", result.stdout.strip())
+            else:
+                logger.debug("Hindsight: could not clear stale tasks: %s", result.stderr.strip())
+        except Exception as e:
+            logger.debug("Hindsight: stale task cleanup skipped: %s", e)
+
     def _reconnect_client(self):
         """Reset the embedded client so _ensure_started() re-launches the daemon."""
         with self._reconnect_lock:
@@ -875,6 +896,9 @@ class HindsightMemoryProvider(MemoryProvider):
             import hindsight_embed.daemon_embed_manager as dem
             from rich.console import Console
             dem.console = Console(file=open(log_path, "a"), force_terminal=False)
+
+            # Clear stale consolidation tasks that crash the daemon on restart
+            self._clear_stale_tasks()
 
             # Re-trigger daemon startup
             self._client._started = False
