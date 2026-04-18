@@ -919,6 +919,41 @@ def load_soul_md() -> Optional[str]:
         return None
 
 
+def load_hermes_md_global() -> Optional[str]:
+    """Load HERMES.md from HERMES_HOME and return its content, or None.
+
+    This is a cwd-independent behavioral-guidelines file. A single file at
+    ``$HERMES_HOME/HERMES.md`` applies to every Hermes session regardless
+    of frontend (UI, CLI, Discord, Telegram) or working directory.
+
+    Loads alongside SOUL.md (which serves the identity slot); this one
+    serves the global behavioral-rules slot. Project-local .hermes.md /
+    HERMES.md picked up by ``_load_hermes_md`` via cwd walk is loaded in
+    addition — project-local instructions extend, not replace, the global
+    file.
+    """
+    try:
+        from hermes_cli.config import ensure_hermes_home
+        ensure_hermes_home()
+    except Exception as e:
+        logger.debug("Could not ensure HERMES_HOME before loading global HERMES.md: %s", e)
+
+    hermes_md_path = get_hermes_home() / "HERMES.md"
+    if not hermes_md_path.exists():
+        return None
+    try:
+        content = hermes_md_path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _strip_yaml_frontmatter(content)
+        content = _scan_context_content(content, "HERMES.md")
+        result = f"## HERMES.md (global)\n\n{content}"
+        return _truncate_content(result, "HERMES.md")
+    except Exception as e:
+        logger.debug("Could not read global HERMES.md from %s: %s", hermes_md_path, e)
+        return None
+
+
 def _load_hermes_md(cwd_path: Path) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
@@ -1014,6 +1049,9 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 
     SOUL.md from HERMES_HOME is independent and always included when present.
+    HERMES.md from HERMES_HOME is also independent — a cwd-free global
+    behavioral-guidelines file that extends (does not replace) any
+    project-local .hermes.md / HERMES.md loaded via the cwd walk.
     Each context source is capped at 20,000 chars.
 
     When *skip_soul* is True, SOUL.md is not included here (it was already
@@ -1034,6 +1072,11 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     )
     if project_context:
         sections.append(project_context)
+
+    # Global HERMES.md from HERMES_HOME — cwd-independent behavioral file
+    global_hermes = load_hermes_md_global()
+    if global_hermes:
+        sections.append(global_hermes)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
