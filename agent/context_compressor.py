@@ -708,7 +708,50 @@ class ContextCompressor(ContextEngine):
 
         return "\n\n".join(parts)
 
-    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
+    def _build_tail_digest(self, tail_messages: List[Dict[str, Any]], max_chars: int = 2000) -> str:
+        """Build a brief digest of user messages from the protected tail.
+
+        The summarizer only sees the middle turns being compressed, but
+        needs awareness of what the user moved on to in the tail so that
+        fields like "Active Task" and "In Progress" reflect the *current*
+        state rather than stale middle-turn state.
+
+        Only user messages are included (assistant responses are implied).
+        Content is truncated to ``max_chars`` total to keep the digest
+        token-efficient.
+        """
+        user_snippets = []
+        total = 0
+        for msg in tail_messages:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content") or ""
+            if isinstance(content, list):
+                # Handle multi-part content blocks (text only)
+                content = " ".join(
+                    part.get("text", "") for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            content = content.strip()
+            if not content:
+                continue
+            # Truncate individual messages to keep things tight
+            if len(content) > 500:
+                content = content[:500] + "..."
+            if total + len(content) > max_chars:
+                remaining = max_chars - total
+                if remaining > 50:
+                    user_snippets.append(content[:remaining] + "...")
+                break
+            user_snippets.append(content)
+            total += len(content)
+
+        if not user_snippets:
+            return ""
+
+        return "USER MESSAGES FROM RECENT TAIL (these are AFTER the turns being summarized):\n" + "\n---\n".join(user_snippets)
+
+    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None, tail_messages: List[Dict[str, Any]] = None) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
         Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
@@ -842,6 +885,23 @@ TURNS TO SUMMARIZE:
 Use this exact structure:
 
 {_template_sections}"""
+
+        # Inject tail digest so the summarizer knows what the user moved on to
+        # in the protected tail.  This prevents "Active Task" and "In Progress"
+        # from reflecting stale state that was superseded by later user messages.
+        if tail_messages:
+            tail_digest = self._build_tail_digest(tail_messages)
+            if tail_digest:
+                prompt += f"""
+
+IMPORTANT — RECENT CONTEXT (protected tail, NOT being summarized):
+The following user messages occurred AFTER the turns above. They are kept
+verbatim in context and are shown here ONLY so you can correctly determine
+the user's CURRENT task and state. Use them to update "## Active Task",
+"## In Progress", and "## Remaining Work" to reflect what the user is
+ACTUALLY working on now — not what they were doing in the middle turns.
+
+{tail_digest}"""
 
         # Inject focus topic guidance when the user provides one via /compress <focus>.
         # This goes at the end of the prompt so it takes precedence.
@@ -1314,7 +1374,10 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
 
         # Phase 3: Generate structured summary
-        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+        # Pass the protected tail so the summarizer can see what the user
+        # moved on to — prevents stale "Active Task" fields.
+        tail_for_digest = messages[compress_end:] if compress_end < n_messages else None
+        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic, tail_messages=tail_for_digest)
 
         # Phase 4: Assemble compressed message list
         compressed = []
